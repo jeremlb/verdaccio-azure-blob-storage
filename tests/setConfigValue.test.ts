@@ -1,4 +1,4 @@
-import setConfigValue from '../src/setConfigValue';
+import { setConfigValue } from '../src/utils';
 
 describe('Setting config values', () => {
   const bucket = 'TEST_AWS_S3_BUCKET_NAME';

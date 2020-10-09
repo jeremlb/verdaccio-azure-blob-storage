@@ -6,32 +6,36 @@ import { HttpError } from 'http-errors';
 
 import { is404Error, convertS3Error, create409Error } from './s3Errors';
 import { deleteKeyPrefix } from './deleteKeyPrefix';
-import { S3Config } from './config';
-import addTrailingSlash from './addTrailingSlash';
+import { StorageConfig } from './config';
+import { addTrailingSlash, streamToBuffer } from './utils';
+import { BlobServiceClient, ContainerClient, StorageSharedKeyCredential } from '@azure/storage-blob';
 
 const pkgFileName = 'package.json';
 
-export default class S3PackageManager implements ILocalPackageManager {
-  public config: S3Config;
+export default class StoragePackageManager implements ILocalPackageManager {
+  public config: StorageConfig;
   public logger: Logger;
   private readonly packageName: string;
-  private readonly s3: S3;
+  private readonly container: ContainerClient;
   private readonly packagePath: string;
 
-  public constructor(config: S3Config, packageName: string, logger: Logger) {
+  public constructor(config: StorageConfig, packageName: string, logger: Logger) {
     this.config = config;
     this.packageName = packageName;
     this.logger = logger;
-    const { endpoint, region, s3ForcePathStyle, accessKeyId, secretAccessKey, sessionToken } = config;
+    const { accountName, accountKey, endpointSuffix, keyPrefix, containerName } = config;
 
-    this.s3 = new S3({ endpoint, region, s3ForcePathStyle, accessKeyId, secretAccessKey, sessionToken });
-    this.logger.trace({ packageName }, 's3: [S3PackageManager constructor] packageName @{packageName}');
-    this.logger.trace({ endpoint }, 's3: [S3PackageManager constructor] endpoint @{endpoint}');
-    this.logger.trace({ region }, 's3: [S3PackageManager constructor] region @{region}');
-    this.logger.trace({ s3ForcePathStyle }, 's3: [S3PackageManager constructor] s3ForcePathStyle @{s3ForcePathStyle}');
-    this.logger.trace({ accessKeyId }, 's3: [S3PackageManager constructor] accessKeyId @{accessKeyId}');
-    this.logger.trace({ secretAccessKey }, 's3: [S3PackageManager constructor] secretAccessKey @{secretAccessKey}');
-    this.logger.trace({ sessionToken }, 's3: [S3PackageManager constructor] sessionToken @{sessionToken}');
+    const creds = new StorageSharedKeyCredential(accountName, accountKey);
+    const blob = new BlobServiceClient(`https://${accountName}.blob.${endpointSuffix}`, creds);
+
+    this.container = blob.getContainerClient(containerName);
+
+    this.logger.trace({ packageName }, 'blob: [StoragePackageManager constructor] packageName @{packageName}');
+    this.logger.trace({ accountName }, 'blob: [StoragePackageManager constructor] accountName @{accountName}');
+    this.logger.trace({ accountKey }, 'blob: [StoragePackageManager constructor] accountKey @{accountKey}');
+    this.logger.trace({ endpointSuffix }, 'blob: [StoragePackageManager constructor] endpointSuffix @{endpointSuffix}');
+    this.logger.trace({ keyPrefix }, 'blob: [StoragePackageManager constructor] keyPrefix @{keyPrefix}');
+    this.logger.trace({ containerName }, 'blob: [StoragePackageManager constructor] containerName @{containerName}');
 
     const packageAccess = this.config.getMatchedPackagesSpec(packageName);
     if (packageAccess) {
@@ -50,79 +54,51 @@ export default class S3PackageManager implements ILocalPackageManager {
     transformPackage: Function,
     onEnd: Callback
   ): void {
-    this.logger.debug({ name }, 's3: [S3PackageManager updatePackage init] @{name}');
+    this.logger.debug({ name }, 'blob: [StoragePackageManager updatePackage init] @{name}');
     (async (): Promise<any> => {
       try {
         const json = await this._getData();
         updateHandler(json, err => {
           if (err) {
-            this.logger.error({ err }, 's3: [S3PackageManager updatePackage updateHandler onEnd] @{err}');
+            this.logger.error({ err }, 'blob: [StoragePackageManager updatePackage updateHandler onEnd] @{err}');
             onEnd(err);
           } else {
             const transformedPackage = transformPackage(json);
             this.logger.debug(
               { transformedPackage },
-              's3: [S3PackageManager updatePackage updateHandler onWrite] @{transformedPackage}'
+              'blob: [StoragePackageManager updatePackage updateHandler onWrite] @{transformedPackage}'
             );
             onWrite(name, transformedPackage, onEnd);
           }
         });
       } catch (err) {
-        this.logger.error({ err }, 's3: [S3PackageManager updatePackage updateHandler onEnd catch] @{err}');
+        this.logger.error({ err }, 'blob: [StoragePackageManager updatePackage updateHandler onEnd catch] @{err}');
 
         return onEnd(err);
       }
     })();
   }
 
+
   private async _getData(): Promise<unknown> {
-    this.logger.debug('s3: [S3PackageManager _getData init]');
-    return await new Promise((resolve, reject): void => {
-      this.s3.getObject(
-        {
-          Bucket: this.config.bucket,
-          Key: `${this.packagePath}/${pkgFileName}`,
-        },
-        (err, response) => {
-          if (err) {
-            this.logger.error({ err: err.message }, 's3: [S3PackageManager _getData] aws @{err}');
-            const error: HttpError = convertS3Error(err);
-            this.logger.error({ error: err.message }, 's3: [S3PackageManager _getData] @{error}');
+    this.logger.debug('blob: [StoragePackageManager _getData init]');
 
-            reject(error);
-            return;
-          }
-          const body = response.Body ? response.Body.toString() : '';
-          let data;
-          try {
-            data = JSON.parse(body);
-          } catch (e) {
-            this.logger.error({ body }, 's3: [S3PackageManager _getData] error parsing: @{body}');
-            reject(e);
-            return;
-          }
+    return await new Promise(async (resolve, reject): Promise<void> => {
+      const blob = this.container.getBlobClient(`${this.packagePath}/${pkgFileName}`);
+      const client = blob.getBlockBlobClient();
 
-          this.logger.trace({ data }, 's3: [S3PackageManager _getData body] @{data.name}');
-          resolve(data);
-        }
-      );
-    });
-  }
-
-  public deletePackage(fileName: string, callback: Callback): void {
-    this.s3.deleteObject(
-      {
-        Bucket: this.config.bucket,
-        Key: `${this.packagePath}/${fileName}`,
-      },
-      err => {
-        if (err) {
-          callback(err);
-        } else {
-          callback(null);
-        }
+      try {
+        const downloadBlockBlobResponse = await client.download();
+        const downloaded = await streamToBuffer(downloadBlockBlobResponse.readableStreamBody);
+        const data = JSON.parse(downloaded.toString());
+        this.logger.trace({ body: downloaded.toString() }, 'blob: [StoragePackageManager _getData] get data @{body}');
+        resolve(data);
+        return;
+      } catch (e: Error) {
+        this.logger.error({ err: e.message }, 'blob: [StoragePackageManager _getData] storage @{err}');
+        reject(e);
       }
-    );
+    });
   }
 
   public removePackage(callback: CallbackAction): void {
@@ -142,12 +118,27 @@ export default class S3PackageManager implements ILocalPackageManager {
     );
   }
 
+  public deletePackage(fileName: string, callback: Callback): void {
+    const blob = this.container.getBlobClient(`${this.packagePath}/${pkgFileName}`);
+    const client = blob.getBlockBlobClient();
+
+    client.delete()
+      .then(() => {
+        this.logger.trace({}, 'blob: [StoragePackageManager deletePackage] package deleted');
+        callback(null);
+      })
+      .catch((e) => {
+        this.logger.trace({ err: e.message }, 'blob: [StoragePackageManager deletePackage] error @{err}');
+        callback(e);
+      });
+  }
+
   public createPackage(name: string, value: Package, callback: CallbackAction): void {
     this.logger.debug(
       { name, packageName: this.packageName },
-      's3: [S3PackageManager createPackage init] name @{name}/@{packageName}'
+      'blob: [StoragePackageManager createPackage init] name @{name}/@{packageName}'
     );
-    this.logger.trace({ value }, 's3: [S3PackageManager createPackage init] name @value');
+    this.logger.trace({ value }, 'blob: [StoragePackageManager createPackage init] name @value');
     this.s3.headObject(
       {
         Bucket: this.config.bucket,
@@ -158,15 +149,15 @@ export default class S3PackageManager implements ILocalPackageManager {
           const s3Err = convertS3Error(err);
           // only allow saving if this file doesn't exist already
           if (is404Error(s3Err)) {
-            this.logger.debug({ s3Err }, 's3: [S3PackageManager createPackage] 404 package not found]');
+            this.logger.debug({ s3Err }, 'blob: [StoragePackageManager createPackage] 404 package not found]');
             this.savePackage(name, value, callback);
-            this.logger.trace({ data }, 's3: [S3PackageManager createPackage] package saved data from s3: @data');
+            this.logger.trace({ data }, 'blob: [StoragePackageManager createPackage] package saved data from blob: @data');
           } else {
-            this.logger.error({ s3Err: s3Err.message }, 's3: [S3PackageManager createPackage error] @s3Err');
+            this.logger.error({ s3Err: s3Err.message }, 'blob: [StoragePackageManager createPackage error] @s3Err');
             callback(s3Err);
           }
         } else {
-          this.logger.debug('s3: [S3PackageManager createPackage ] package exist already');
+          this.logger.debug('blob: [StoragePackageManager createPackage ] package exist already');
           callback(create409Error());
         }
       }
@@ -176,9 +167,9 @@ export default class S3PackageManager implements ILocalPackageManager {
   public savePackage(name: string, value: Package, callback: CallbackAction): void {
     this.logger.debug(
       { name, packageName: this.packageName },
-      's3: [S3PackageManager savePackage init] name @{name}/@{packageName}'
+      'blob: [StoragePackageManager savePackage init] name @{name}/@{packageName}'
     );
-    this.logger.trace({ value }, 's3: [S3PackageManager savePackage ] init value @value');
+    this.logger.trace({ value }, 'blob: [StoragePackageManager savePackage ] init value @value');
     this.s3.putObject(
       {
         // TODO: not sure whether save the object with spaces will increase storage size
@@ -193,18 +184,18 @@ export default class S3PackageManager implements ILocalPackageManager {
   public readPackage(name: string, callback: ReadPackageCallback): void {
     this.logger.debug(
       { name, packageName: this.packageName },
-      's3: [S3PackageManager readPackage init] name @{name}/@{packageName}'
+      'blob: [StoragePackageManager readPackage init] name @{name}/@{packageName}'
     );
     (async (): Promise<void> => {
       try {
         const data: Package = (await this._getData()) as Package;
         this.logger.trace(
           { data, packageName: this.packageName },
-          's3: [S3PackageManager readPackage] packageName: @{packageName} / data @data'
+          'blob: [StoragePackageManager readPackage] packageName: @{packageName} / data @data'
         );
         callback(null, data);
       } catch (err) {
-        this.logger.error({ err: err.message }, 's3: [S3PackageManager readPackage] @{err}');
+        this.logger.error({ err: err.message }, 'blob: [StoragePackageManager readPackage] @{err}');
 
         callback(err);
       }
@@ -214,7 +205,7 @@ export default class S3PackageManager implements ILocalPackageManager {
   public writeTarball(name: string): UploadTarball {
     this.logger.debug(
       { name, packageName: this.packageName },
-      's3: [S3PackageManager writeTarball init] name @{name}/@{packageName}'
+      'blob: [StoragePackageManager writeTarball init] name @{name}/@{packageName}'
     );
     const uploadStream = new UploadTarball({});
 
@@ -222,7 +213,7 @@ export default class S3PackageManager implements ILocalPackageManager {
     uploadStream.on('end', () => {
       this.logger.debug(
         { name, packageName: this.packageName },
-        's3: [S3PackageManager writeTarball event: end] name @{name}/@{packageName}'
+        'blob: [StoragePackageManager writeTarball event: end] name @{name}/@{packageName}'
       );
       streamEnded = 1;
     });
@@ -243,43 +234,43 @@ export default class S3PackageManager implements ILocalPackageManager {
       err => {
         if (err) {
           const convertedErr = convertS3Error(err);
-          this.logger.error({ error: convertedErr.message }, 's3: [S3PackageManager writeTarball headObject] @{error}');
+          this.logger.error({ error: convertedErr.message }, 'blob: [StoragePackageManager writeTarball headObject] @{error}');
 
           if (is404Error(convertedErr) === false) {
             this.logger.error(
               {
                 error: convertedErr.message,
               },
-              's3: [S3PackageManager writeTarball headObject] non a 404 emit error: @{error}'
+              'blob: [StoragePackageManager writeTarball headObject] non a 404 emit error: @{error}'
             );
 
             uploadStream.emit('error', convertedErr);
           } else {
-            this.logger.debug('s3: [S3PackageManager writeTarball managedUpload] init stream');
+            this.logger.debug('blob: [StoragePackageManager writeTarball managedUpload] init stream');
             const managedUpload = this.s3.upload(Object.assign({}, baseS3Params, { Body: uploadStream }));
             // NOTE: there's a managedUpload.promise, but it doesn't seem to work
             const promise = new Promise((resolve): void => {
-              this.logger.debug('s3: [S3PackageManager writeTarball managedUpload] send');
+              this.logger.debug('blob: [StoragePackageManager writeTarball managedUpload] send');
               managedUpload.send((err, data) => {
                 if (err) {
                   const error: HttpError = convertS3Error(err);
                   this.logger.error(
                     { error: error.message },
-                    's3: [S3PackageManager writeTarball managedUpload send] emit error @{error}'
+                    'blob: [StoragePackageManager writeTarball managedUpload send] emit error @{error}'
                   );
 
                   uploadStream.emit('error', error);
                 } else {
                   this.logger.trace(
                     { data },
-                    's3: [S3PackageManager writeTarball managedUpload send] response @{data}'
+                    'blob: [StoragePackageManager writeTarball managedUpload send] response @{data}'
                   );
 
                   resolve();
                 }
               });
 
-              this.logger.debug({ name }, 's3: [S3PackageManager writeTarball uploadStream] emit open @{name}');
+              this.logger.debug({ name }, 'blob: [StoragePackageManager writeTarball uploadStream] emit open @{name}');
               uploadStream.emit('open');
             });
 
@@ -288,33 +279,33 @@ export default class S3PackageManager implements ILocalPackageManager {
                 try {
                   await promise;
 
-                  this.logger.debug('s3: [S3PackageManager writeTarball uploadStream done] emit success');
+                  this.logger.debug('blob: [StoragePackageManager writeTarball uploadStream done] emit success');
                   uploadStream.emit('success');
                 } catch (err) {
                   // already emitted in the promise above, necessary because of some issues
                   // with promises in jest
-                  this.logger.error({ err }, 's3: [S3PackageManager writeTarball uploadStream done] error @{err}');
+                  this.logger.error({ err }, 'blob: [StoragePackageManager writeTarball uploadStream done] error @{err}');
                 }
               };
               if (streamEnded) {
                 this.logger.trace(
                   { name },
-                  's3: [S3PackageManager writeTarball uploadStream] streamEnded true @{name}'
+                  'blob: [StoragePackageManager writeTarball uploadStream] streamEnded true @{name}'
                 );
                 onEnd();
               } else {
                 this.logger.trace(
                   { name },
-                  's3: [S3PackageManager writeTarball uploadStream] streamEnded false emit end @{name}'
+                  'blob: [StoragePackageManager writeTarball uploadStream] streamEnded false emit end @{name}'
                 );
                 uploadStream.on('end', onEnd);
               }
             };
 
             uploadStream.abort = (): void => {
-              this.logger.debug('s3: [S3PackageManager writeTarball uploadStream abort] init');
+              this.logger.debug('blob: [StoragePackageManager writeTarball uploadStream abort] init');
               try {
-                this.logger.debug('s3: [S3PackageManager writeTarball managedUpload abort]');
+                this.logger.debug('blob: [StoragePackageManager writeTarball managedUpload abort]');
                 managedUpload.abort();
               } catch (err) {
                 const error: HttpError = convertS3Error(err);
@@ -322,12 +313,12 @@ export default class S3PackageManager implements ILocalPackageManager {
 
                 this.logger.error(
                   { error },
-                  's3: [S3PackageManager writeTarball uploadStream error] emit error @{error}'
+                  'blob: [StoragePackageManager writeTarball uploadStream error] emit error @{error}'
                 );
               } finally {
                 this.logger.debug(
                   { name, baseS3Params },
-                  's3: [S3PackageManager writeTarball uploadStream abort] s3.deleteObject @{name}/@baseS3Params'
+                  'blob: [StoragePackageManager writeTarball uploadStream abort] s3.deleteObject @{name}/@baseS3Params'
                 );
 
                 this.s3.deleteObject(baseS3Params);
@@ -335,7 +326,7 @@ export default class S3PackageManager implements ILocalPackageManager {
             };
           }
         } else {
-          this.logger.debug({ name }, 's3: [S3PackageManager writeTarball headObject] emit error @{name} 409');
+          this.logger.debug({ name }, 'blob: [StoragePackageManager writeTarball headObject] emit error @{name} 409');
 
           uploadStream.emit('error', create409Error());
         }
@@ -348,7 +339,7 @@ export default class S3PackageManager implements ILocalPackageManager {
   public readTarball(name: string): ReadTarball {
     this.logger.debug(
       { name, packageName: this.packageName },
-      's3: [S3PackageManager readTarball init] name @{name}/@{packageName}'
+      'blob: [StoragePackageManager readTarball init] name @{name}/@{packageName}'
     );
     const readTarballStream = new ReadTarball({});
 
@@ -369,12 +360,12 @@ export default class S3PackageManager implements ILocalPackageManager {
         // https://github.com/verdaccio/verdaccio/blob/c1bc261/src/lib/storage.js#L178
         this.logger.debug(
           { name, packageName: this.packageName },
-          's3: [S3PackageManager readTarball httpHeaders] name @{name}/@{packageName}'
+          'blob: [StoragePackageManager readTarball httpHeaders] name @{name}/@{packageName}'
         );
-        this.logger.trace({ headers }, 's3: [S3PackageManager readTarball httpHeaders event] headers @headers');
+        this.logger.trace({ headers }, 'blob: [StoragePackageManager readTarball httpHeaders event] headers @headers');
         this.logger.trace(
           { statusCode },
-          's3: [S3PackageManager readTarball httpHeaders event] statusCode @statusCode'
+          'blob: [StoragePackageManager readTarball httpHeaders event] statusCode @statusCode'
         );
         if (statusCode !== HTTP_STATUS.NOT_FOUND) {
           if (headers[HEADERS.CONTENT_LENGTH]) {
@@ -387,14 +378,14 @@ export default class S3PackageManager implements ILocalPackageManager {
 
             headersSent = true;
 
-            this.logger.debug('s3: [S3PackageManager readTarball readTarballStream event] emit content-length');
+            this.logger.debug('blob: [StoragePackageManager readTarball readTarballStream event] emit content-length');
             readTarballStream.emit(HEADERS.CONTENT_LENGTH, contentLength);
             // we know there's content, so open the stream
             readTarballStream.emit('open');
-            this.logger.debug('s3: [S3PackageManager readTarball readTarballStream event] emit open');
+            this.logger.debug('blob: [StoragePackageManager readTarball readTarballStream event] emit open');
           }
         } else {
-          this.logger.trace('s3: [S3PackageManager readTarball httpHeaders event] not found, avoid emit open file');
+          this.logger.trace('blob: [StoragePackageManager readTarball httpHeaders event] not found, avoid emit open file');
         }
       })
       .createReadStream();
@@ -405,17 +396,17 @@ export default class S3PackageManager implements ILocalPackageManager {
       readTarballStream.emit('error', error);
       this.logger.error(
         { error: error.message },
-        's3: [S3PackageManager readTarball readTarballStream event] error @{error}'
+        'blob: [StoragePackageManager readTarball readTarballStream event] error @{error}'
       );
     });
 
-    this.logger.trace('s3: [S3PackageManager readTarball readTarballStream event] pipe');
+    this.logger.trace('blob: [StoragePackageManager readTarball readTarballStream event] pipe');
     readStream.pipe(readTarballStream);
 
     readTarballStream.abort = (): void => {
-      this.logger.debug('s3: [S3PackageManager readTarball readTarballStream event] request abort');
+      this.logger.debug('blob: [StoragePackageManager readTarball readTarballStream event] request abort');
       request.abort();
-      this.logger.debug('s3: [S3PackageManager readTarball readTarballStream event] request destroy');
+      this.logger.debug('blob: [StoragePackageManager readTarball readTarballStream event] request destroy');
       readStream.destroy();
     };
 

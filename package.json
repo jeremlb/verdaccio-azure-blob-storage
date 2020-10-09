@@ -1,23 +1,21 @@
 {
-  "name": "verdaccio-aws-s3-storage",
+  "name": "verdaccio-azure-blob-storage",
   "version": "9.7.2",
-  "description": "AWS S3 storage implementation for Verdaccio",
+  "description": "Azure blob storage implementation for Verdaccio",
   "keywords": [
     "verdaccio",
     "plugin",
     "storage",
-    "aws"
+    "azure"
   ],
-  "author": "Juan Picado <juanpicado19@gmail.com>",
+  "author": "Jérémi Le Bourhis <jeremi.leb@gmail.com>",
   "license": "MIT",
-  "homepage": "https://verdaccio.org",
   "repository": {
     "type": "git",
-    "url": "https://github.com/verdaccio/monorepo",
-    "directory": "plugins/aws-s3-storage"
+    "url": "https://github.com/jeremlb/verdaccio-azure-blob-storage.git"
   },
   "bugs": {
-    "url": "https://github.com/verdaccio/monorepo/issues"
+    "url": "https://github.com/jeremlb/verdaccio-azure-blob-storage.git/issues"
   },
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -30,8 +28,7 @@
   "dependencies": {
     "@azure/storage-blob": "^12.2.1",
     "@verdaccio/commons-api": "^9.7.1",
-    "@verdaccio/streams": "^9.7.2",
-    "aws-sdk": "^2.607.0"
+    "@verdaccio/streams": "^9.7.2"
   },
   "devDependencies": {
     "@verdaccio/babel-preset": "^9.7.1",
@@ -43,14 +40,10 @@
     "build": "npm run build:types && npm run build:js",
     "build:js": "babel src/ --out-dir lib --extensions \".ts,.tsx\"",
     "build:types": "tsc --emitDeclarationOnly",
-    "coverage:publish": "codecov --root=../../ -F plugins",
+    "coverage:publish": "codecov -F plugins",
     "lint": "eslint \"**/*.{js,ts}\"",
     "test": "jest",
     "type-check": "tsc --noEmit",
     "type-check:watch": "npm run type-check -- --watch"
-  },
-  "funding": {
-    "type": "opencollective",
-    "url": "https://opencollective.com/verdaccio"
   }
 }
